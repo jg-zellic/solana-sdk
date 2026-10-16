@@ -6,8 +6,13 @@ use {
         scalar::Scalar,
         signature::points::{AddToSignatureProjective, SignatureProjective},
     },
-    blstrs::{G2Projective, Scalar as BlstrsScalar},
+    blst::p2_affines,
+    blstrs::Scalar as BlstrsScalar,
 };
+
+/// Bytes and bits blst reads per little-endian scalar.
+const SCALAR_BYTES: usize = 32;
+const SCALAR_BITS: usize = 255;
 
 impl SignatureProjective {
     /// Aggregate a list of signatures into an existing aggregate
@@ -75,21 +80,23 @@ impl SignatureProjective {
             return Err(BlsError::EmptyAggregation);
         }
 
+        // Build the scalar bytes blst consumes directly, rather than a scalar
+        // vector that `G2Projective::multi_exp` would copy into a second buffer.
         let mut points = alloc::vec::Vec::with_capacity(signatures.len());
-        let mut scalar_values = alloc::vec::Vec::with_capacity(scalars.len());
+        let mut scalar_bytes =
+            alloc::vec::Vec::with_capacity(scalars.len().saturating_mul(SCALAR_BYTES));
 
         for (signature, scalar) in signatures.zip(scalars) {
             let mut point = SignatureProjective::identity();
             signature.add_to_accumulator(&mut point)?;
 
-            points.push(point.0);
-            scalar_values.push(scalar);
+            points.push(*point.0.as_ref());
+            scalar_bytes.extend_from_slice(&scalar.to_bytes_le());
         }
 
-        Ok(SignatureProjective(G2Projective::multi_exp(
-            &points,
-            &scalar_values,
-        )))
+        let mut aggregate = SignatureProjective::identity();
+        *aggregate.0.as_mut() = p2_affines::from(&points).mult(&scalar_bytes, SCALAR_BITS);
+        Ok(aggregate)
     }
 
     /// Aggregate a list of signatures into an existing aggregate
@@ -165,5 +172,39 @@ mod tests {
             SignatureProjective::aggregate_with_scalars(signatures.iter(), blstrs_weights.iter())
                 .unwrap();
         assert_eq!(from_weights, from_scalars);
+    }
+
+    #[test]
+    fn test_aggregate_with_weights_matches_blstrs_multi_exp() {
+        use blstrs::G2Projective;
+
+        let message = b"test message";
+        let base = [
+            Keypair::new().sign(message),
+            Keypair::new().sign(message),
+            Keypair::new().sign(message),
+        ];
+        // Cover blst's per-point path below 32 points and Pippenger above it.
+        for n in [1, 2, 31, 32, 33, 64] {
+            // Repeat signatures and include zero and repeated weights.
+            let signatures: alloc::vec::Vec<_> = (0..n).map(|i| base[i % 3]).collect();
+            let weights: alloc::vec::Vec<_> = (0..n)
+                .map(|i| match i % 4 {
+                    0 => Scalar::from(0u64),
+                    1 => Scalar::from(7u64),
+                    _ => Scalar::random(),
+                })
+                .collect();
+
+            let points: alloc::vec::Vec<_> =
+                signatures.iter().map(|signature| signature.0).collect();
+            let scalars: alloc::vec::Vec<_> = weights.iter().map(|weight| weight.0).collect();
+            let expected = G2Projective::multi_exp(&points, &scalars);
+
+            let actual =
+                SignatureProjective::aggregate_with_weights(signatures.iter(), weights.iter())
+                    .unwrap();
+            assert_eq!(actual.0, expected, "n={n}");
+        }
     }
 }

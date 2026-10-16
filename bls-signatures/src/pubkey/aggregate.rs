@@ -6,8 +6,13 @@ use {
         pubkey::points::{AddToPubkeyProjective, AggregatePubkey, PopVerified, PubkeyProjective},
         scalar::Scalar,
     },
-    blstrs::{G1Projective, Scalar as BlstrsScalar},
+    blst::p1_affines,
+    blstrs::Scalar as BlstrsScalar,
 };
+
+/// Bytes and bits blst reads per little-endian scalar.
+const SCALAR_BYTES: usize = 32;
+const SCALAR_BITS: usize = 255;
 
 impl PubkeyProjective {
     /// Aggregate a list of Proof-of-Possession verified public keys into an
@@ -78,21 +83,23 @@ impl PubkeyProjective {
             return Err(BlsError::EmptyAggregation);
         }
 
+        // Build the scalar bytes blst consumes directly, rather than a scalar
+        // vector that `G1Projective::multi_exp` would copy into a second buffer.
         let mut points = alloc::vec::Vec::with_capacity(pubkeys.len());
-        let mut scalar_values = alloc::vec::Vec::with_capacity(scalars.len());
+        let mut scalar_bytes =
+            alloc::vec::Vec::with_capacity(scalars.len().saturating_mul(SCALAR_BYTES));
 
         for (pubkey, scalar) in pubkeys.zip(scalars) {
             let mut point = PubkeyProjective::identity();
             pubkey.0.add_to_accumulator(&mut point)?;
 
-            points.push(point.0);
-            scalar_values.push(scalar);
+            points.push(*point.0.as_ref());
+            scalar_bytes.extend_from_slice(&scalar.to_bytes_le());
         }
 
-        Ok(AggregatePubkey(PubkeyProjective(G1Projective::multi_exp(
-            &points,
-            &scalar_values,
-        ))))
+        let mut aggregate = PubkeyProjective::identity();
+        *aggregate.0.as_mut() = p1_affines::from(&points).mult(&scalar_bytes, SCALAR_BITS);
+        Ok(AggregatePubkey(aggregate))
     }
 
     /// Aggregate a list of Proof-of-Possession verified public keys into an
@@ -168,5 +175,35 @@ mod tests {
             PubkeyProjective::aggregate_with_scalars(pubkeys.iter(), blstrs_weights.iter())
                 .unwrap();
         assert_eq!(from_weights, from_scalars);
+    }
+
+    #[test]
+    fn test_aggregate_with_weights_matches_blstrs_multi_exp() {
+        use blstrs::G1Projective;
+
+        let keypairs = [Keypair::new(), Keypair::new(), Keypair::new()];
+        // Cover blst's per-point path below 32 points and Pippenger above it.
+        for n in [1, 2, 31, 32, 33, 64] {
+            // Repeat keys and include zero and repeated weights.
+            let pubkeys: alloc::vec::Vec<_> = (0..n).map(|i| keypairs[i % 3].public).collect();
+            let weights: alloc::vec::Vec<_> = (0..n)
+                .map(|i| match i % 4 {
+                    0 => Scalar::from(0u64),
+                    1 => Scalar::from(7u64),
+                    _ => Scalar::random(),
+                })
+                .collect();
+
+            let points: alloc::vec::Vec<_> = pubkeys
+                .iter()
+                .map(|pubkey| G1Projective::from(pubkey.0 .0))
+                .collect();
+            let scalars: alloc::vec::Vec<_> = weights.iter().map(|weight| weight.0).collect();
+            let expected = G1Projective::multi_exp(&points, &scalars);
+
+            let actual =
+                PubkeyProjective::aggregate_with_weights(pubkeys.iter(), weights.iter()).unwrap();
+            assert_eq!(actual.0 .0, expected, "n={n}");
+        }
     }
 }

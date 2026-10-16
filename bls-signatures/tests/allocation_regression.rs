@@ -4,6 +4,8 @@
 // Counts successful Rust global-allocator requests through System, not C malloc.
 // Reallocations are separate calls; their full new size contributes to bytes.
 // BLS budgets are upper bounds: reductions pass; tighten after measuring them.
+// Weighted aggregation rows need one CPU, where blst skips its thread pool:
+// taskset -c 0 cargo test -p solana-bls-signatures --release --test allocation_regression
 
 use {
     solana_bls_signatures::{
@@ -11,7 +13,8 @@ use {
         hash::{HashedMessage, HashedPoPPayload, PreparedHashedMessage},
         keypair::Keypair,
         proof_of_possession::ProofOfPossessionAffine,
-        pubkey::{VerifyPop, VerifySignature},
+        pubkey::{PubkeyProjective, VerifyPop, VerifySignature},
+        scalar::Scalar,
         signature::{SignatureAffine, SignatureCompressed, SignatureProjective},
     },
     std::{
@@ -123,6 +126,16 @@ fn check_budget(
         name if name.starts_with("distinct/prepared/seq/shared/") => (3, 1_008),
         name if name.starts_with("distinct/prepared/par/unique/") => (3, 1_008),
         name if name.starts_with("distinct/prepared/par/shared/") => (3, 1_008),
+        // Weighted aggregation on one CPU: point, affine, scalar-byte and
+        // Pippenger scratch buffers.
+        "weighted/pubkey/n2" => (4, 928),
+        "weighted/pubkey/n31" => (4, 8_816),
+        "weighted/pubkey/n32" => (4, 10_240),
+        "weighted/pubkey/n64" => (4, 20_480),
+        "weighted/signature/n2" => (4, 1_792),
+        "weighted/signature/n31" => (4, 16_640),
+        "weighted/signature/n32" => (4, 19_456),
+        "weighted/signature/n64" => (4, 38_912),
         _ => panic!("missing allocation budget for {label}"),
     };
 
@@ -260,6 +273,12 @@ fn run_allocation_regression() {
 
     println!("allocation regression v1; {ITERATIONS} operations per row; 3 passes");
     println!("parallel feature enabled: {}", cfg!(feature = "parallel"));
+    if single_cpu() {
+        println!("weighted rows enabled: one CPU, so blst runs without its thread pool.");
+    } else {
+        println!("weighted rows skipped: blst's thread pool allocates nondeterministically.");
+        println!("Run under `taskset -c 0` to include them.");
+    }
     println!("raw/pre_hashed/prepared use affine keys and affine signatures.");
     println!("raw_compressed also decodes the compressed signature each time.");
     println!("Counts include destruction of temporaries within each operation.");
@@ -302,6 +321,9 @@ fn run_allocation_regression() {
 
         measure_pop_paths(&keypair, &other_keypair);
         measure_distinct_prepared_paths(&keypair, &other_keypair);
+        if single_cpu() {
+            measure_weighted_paths();
+        }
 
         for (status, encoded, expected) in [
             ("valid", &valid, Ok(())),
@@ -467,5 +489,43 @@ fn measure_distinct_prepared_paths(keypair: &Keypair, other_keypair: &Keypair) {
                 ) == expected
             });
         }
+    }
+}
+
+// blst sizes its pool from the CPUs this process may use.
+fn single_cpu() -> bool {
+    std::thread::available_parallelism().is_ok_and(|cpus| cpus.get() == 1)
+}
+
+fn measure_weighted_paths() {
+    // Sizes on both sides of blst's 32-point Pippenger cutoff.
+    for n in [2u8, 31, 32, 64] {
+        // Build fixtures with counting disabled.
+        let keypairs: Vec<Keypair> = (1..=n)
+            .map(|seed| Keypair::derive(&[seed; 32]).expect("derive weighted fixture key"))
+            .collect();
+        let public_keys: Vec<_> = keypairs.iter().map(|keypair| keypair.public).collect();
+        let signatures: Vec<SignatureAffine> = keypairs
+            .iter()
+            .map(|keypair| keypair.sign(b"weighted allocation").into())
+            .collect();
+        let weights: Vec<Scalar> = (3..u64::from(n).saturating_add(3))
+            .map(Scalar::from)
+            .collect();
+
+        measure(&format!("weighted/pubkey/n{n}"), || {
+            PubkeyProjective::aggregate_with_weights(
+                black_box(&public_keys).iter(),
+                black_box(&weights).iter(),
+            )
+            .is_ok()
+        });
+        measure(&format!("weighted/signature/n{n}"), || {
+            SignatureProjective::aggregate_with_weights(
+                black_box(&signatures).iter(),
+                black_box(&weights).iter(),
+            )
+            .is_ok()
+        });
     }
 }
